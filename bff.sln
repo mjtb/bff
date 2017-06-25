@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio 15
+VisualStudioVersion = 15.0.26403.7
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "bff", "bff.vcxproj", "{169518FB-4F67-4238-9DA6-2FED13197CF2}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{BDD862C4-3FAD-4CDD-BA1D-775EF0F7F483}"
+	ProjectSection(SolutionItems) = preProject
+		LICENSE = LICENSE
+		README.md = README.md
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{169518FB-4F67-4238-9DA6-2FED13197CF2}.Debug|x64.ActiveCfg = Debug|x64
+		{169518FB-4F67-4238-9DA6-2FED13197CF2}.Debug|x64.Build.0 = Debug|x64
+		{169518FB-4F67-4238-9DA6-2FED13197CF2}.Release|x64.ActiveCfg = Release|x64
+		{169518FB-4F67-4238-9DA6-2FED13197CF2}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
