@@ -1,4 +1,3 @@
-123456789012345678901234567890123456789012345678901234567890123456789012
 # Black Frame Filter (bff)
 
 Black Frame Filter is a native C++ command-line utility for processing
