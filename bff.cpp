@@ -15,6 +15,8 @@ extern "C" {
 #include <libavutil\imgutils.h>
 #include <libswscale\swscale.h>
 #include <libswresample\swresample.h>
+#include <libavfilter\buffersrc.h>
+#include <libavfilter\buffersink.h>
 }
 
 static bool is_black_frame(AVFrame *frame);
@@ -254,6 +256,76 @@ int bff(const cliopts & opts)
 									swr_free(&p);
 								}
 							});
+							// configure filter graph for deinterlacing
+							std::unique_ptr<AVFilterGraph, std::function<void(AVFilterGraph*)>> filter_graph(avfilter_graph_alloc(), [](AVFilterGraph *p) {
+								avfilter_graph_free(&p);
+							});
+							AVFilterContext * bufferctx = nullptr;
+							AVFilterContext * buffersinkctx = nullptr;
+							{
+								AVFilter * buffer = avfilter_get_by_name("buffer");
+								if (!buffer) {
+									std::cerr << "error:\tno buffer filter" << std::endl;
+									return 2;
+								}
+								AVFilter * buffersink = avfilter_get_by_name("buffersink");
+								if (!buffersink) {
+									std::cerr << "error:\tno buffersink filter" << std::endl;
+									return 2;
+								}
+								const size_t arglen = 32*32;
+								char * args = (char *)alloca(arglen);
+								memset(args, 0, arglen);
+								AVRational time_base = ovcodec->time_base;
+								snprintf(args, arglen, "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d", ovcodec->width, ovcodec->height, ovcodec->pix_fmt, time_base.num, time_base.den, ovcodec->sample_aspect_ratio.num, ovcodec->sample_aspect_ratio.den);
+								rv = avfilter_graph_create_filter(&bufferctx, buffer, "in", args, nullptr, filter_graph.get());
+								if (rv < 0) {
+									char msg[100] = { 0 };
+									av_strerror(rv, msg, sizeof(msg) - 1);
+									std::cerr << "error:\tfailed to create in filter (" << rv << ")" << std::endl;
+									std::cerr << "\t" << msg << std::endl;
+									return rv;
+								}
+								rv = avfilter_graph_create_filter(&buffersinkctx, buffersink, "out", nullptr, nullptr, filter_graph.get());
+								if (rv < 0) {
+									char msg[100] = { 0 };
+									av_strerror(rv, msg, sizeof(msg) - 1);
+									std::cerr << "error:\tfailed to create out filter (" << rv << ")" << std::endl;
+									std::cerr << "\t" << msg << std::endl;
+									return rv;
+								}
+								AVFilterInOut * inputs = avfilter_inout_alloc(), *outputs = avfilter_inout_alloc();
+								if (!outputs || !inputs) {
+									std::cerr << "error:\tfilter inout allocation failure" << std::endl;
+									return 2;
+								}
+								outputs->name = av_strdup("in");
+								outputs->filter_ctx = bufferctx;
+								outputs->pad_idx = 0;
+								outputs->next = nullptr;
+								inputs->name = av_strdup("out");
+								inputs->filter_ctx = buffersinkctx;
+								inputs->pad_idx = 0;
+								inputs->next = nullptr;
+								rv = avfilter_graph_parse_ptr(filter_graph.get(), "kerndeint", &inputs, &outputs, nullptr);
+								avfilter_inout_free(&inputs);
+								avfilter_inout_free(&outputs);
+								if (rv < 0) {
+									char msg[100] = { 0 };
+									av_strerror(rv, msg, sizeof(msg) - 1);
+									std::cerr << "error:\tfailed to parse filter expr (" << rv << ")" << std::endl;
+									std::cerr << "\t" << msg << std::endl;
+									return rv;
+								}
+								rv = avfilter_graph_config(filter_graph.get(), nullptr);
+								if (rv < 0) {
+									char msg[100] = { 0 };
+									av_strerror(rv, msg, sizeof(msg) - 1);
+									std::cerr << "error:\tfailed to configure filter graph (" << rv << ")" << std::endl;
+									std::cerr << "\t" << msg << std::endl;
+									return rv;
+								}
+							}
 							// read
 							AVPacket inpacket = { 0 };
 							std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame(av_frame_alloc(), [](AVFrame * p) {
@@ -262,7 +334,10 @@ int bff(const cliopts & opts)
 							std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> prev_frame(av_frame_alloc(), [](AVFrame * p) {
 								av_frame_free(&p);
 							});
-							if (!frame || !prev_frame) {
+							std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> deinterlaced_frame(av_frame_alloc(), [](AVFrame * p) {
+								av_frame_free(&p);
+							});
+							if (!frame || !prev_frame || !deinterlaced_frame) {
 								std::cerr << "error: cannot allocate required frames" << std::endl;
 								return 2;
 							}
@@ -351,98 +426,123 @@ int bff(const cliopts & opts)
 												}
 											}
 											AVFrame * curframe = sws_required ? sws_frame.get() : frame.get();
-											std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frameref(curframe, [](AVFrame *p) {
+											curframe->pts = curframe->best_effort_timestamp;
+											std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> curframeref(curframe, [](AVFrame *p) {
 												av_frame_unref(p);
 											});
-											if (is_black_frame(curframe)) {
-												if (have_prev_frame) {
-													rv = av_frame_copy(curframe, prev_frame.get());
-													if (rv < 0) {
-														char msg[100] = { 0 };
-														av_strerror(rv, msg, sizeof(msg) - 1);
-														std::cerr << "error:\tfailed to copy previous video frame data (" << rv << ")" << std::endl;
-														std::cerr << "\t" << msg << std::endl;
-														return rv;
-													}
-												}
-											} else {
-												if (!have_prev_frame) {
-													prev_frame->format = curframe->format;
-													prev_frame->width = curframe->width;
-													prev_frame->height = curframe->height;
-													memcpy(prev_frame->linesize, curframe->linesize, sizeof(prev_frame->linesize));
-													rv = av_frame_get_buffer(prev_frame.get(), 0);
-													if (rv < 0) {
-														char msg[100] = { 0 };
-														av_strerror(rv, msg, sizeof(msg) - 1);
-														std::cerr << "error:\tfailed to allocate video frame data (" << rv << ")" << std::endl;
-														std::cerr << "\t" << msg << std::endl;
-														return rv;
-													}
-													have_prev_frame = true;
-												}
-												rv = av_frame_copy(prev_frame.get(), curframe);
-												if (rv < 0) {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to copy current video frame data (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
-												}
-												rv = av_frame_copy_props(prev_frame.get(), curframe);
-												if (rv < 0) {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to frame metadata (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
-												}
-											}
-											curframe->pts = curframe->best_effort_timestamp;
-											rv = avcodec_send_frame(ovcodec.get(), curframe);
+											// todo: filter
+											rv = av_buffersrc_add_frame_flags(bufferctx, curframe, AV_BUFFERSRC_FLAG_KEEP_REF);
 											if (rv < 0) {
 												char msg[100] = { 0 };
 												av_strerror(rv, msg, sizeof(msg) - 1);
-												std::cerr << "error:\tfailed to encode video frame (" << rv << ")" << std::endl;
+												std::cerr << "error:\tfailed to push frame into filter graph (" << rv << ")" << std::endl;
 												std::cerr << "\t" << msg << std::endl;
 												return rv;
 											}
 											while (true) {
-												AVPacket outpacket = { 0 };
-												av_init_packet(&outpacket);
-												rv = avcodec_receive_packet(ovcodec.get(), &outpacket);
-												if (rv >= 0) {
-													++video_packet_count;
-													outpacket.stream_index = video_stream_index;
-													av_packet_rescale_ts(&outpacket, ovcodec->time_base, ovstream->time_base);
-													if (outpacket.pts <= vpts) {
-														++vpts;
-														outpacket.pts = vpts;
-													} else {
-														vpts = outpacket.pts;
+												rv = av_buffersink_get_frame(buffersinkctx, deinterlaced_frame.get());
+												if ((rv == AVERROR(EAGAIN)) || (rv == AVERROR_EOF)) {
+													break;
+												} else if (rv < 0) {
+													char msg[100] = { 0 };
+													av_strerror(rv, msg, sizeof(msg) - 1);
+													std::cerr << "error:\tfailed to pull frames into filter graph (" << rv << ")" << std::endl;
+													std::cerr << "\t" << msg << std::endl;
+													return rv;
+												}
+												AVFrame * diframe = deinterlaced_frame.get();
+												std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> diframeref(diframe, [](AVFrame *p) {
+													av_frame_unref(p);
+												});
+												if (is_black_frame(diframe)) {
+													if (have_prev_frame) {
+														rv = av_frame_copy(diframe, prev_frame.get());
+														if (rv < 0) {
+															char msg[100] = { 0 };
+															av_strerror(rv, msg, sizeof(msg) - 1);
+															std::cerr << "error:\tfailed to copy previous video frame data (" << rv << ")" << std::endl;
+															std::cerr << "\t" << msg << std::endl;
+															return rv;
+														}
 													}
-													if (outpacket.dts <= vdts) {
-														++vdts;
-														outpacket.dts = vdts;
-													} else {
-														vdts = outpacket.dts;
+												} else {
+													if (!have_prev_frame) {
+														prev_frame->format = diframe->format;
+														prev_frame->width = diframe->width;
+														prev_frame->height = diframe->height;
+														memcpy(prev_frame->linesize, diframe->linesize, sizeof(prev_frame->linesize));
+														rv = av_frame_get_buffer(prev_frame.get(), 0);
+														if (rv < 0) {
+															char msg[100] = { 0 };
+															av_strerror(rv, msg, sizeof(msg) - 1);
+															std::cerr << "error:\tfailed to allocate video frame data (" << rv << ")" << std::endl;
+															std::cerr << "\t" << msg << std::endl;
+															return rv;
+														}
+														have_prev_frame = true;
 													}
-													rv = av_interleaved_write_frame(oformat.get(), &outpacket);
+													rv = av_frame_copy(prev_frame.get(), diframe);
 													if (rv < 0) {
 														char msg[100] = { 0 };
 														av_strerror(rv, msg, sizeof(msg) - 1);
-														std::cerr << "error:\tfailed to write interleaved video frame (" << rv << ")" << std::endl;
+														std::cerr << "error:\tfailed to copy current video frame data (" << rv << ")" << std::endl;
 														std::cerr << "\t" << msg << std::endl;
 														return rv;
 													}
-												} else if (rv == AVERROR(EAGAIN)) {
-													break;
-												} else {
+													rv = av_frame_copy_props(prev_frame.get(), diframe);
+													if (rv < 0) {
+														char msg[100] = { 0 };
+														av_strerror(rv, msg, sizeof(msg) - 1);
+														std::cerr << "error:\tfailed to frame metadata (" << rv << ")" << std::endl;
+														std::cerr << "\t" << msg << std::endl;
+														return rv;
+													}
+												}
+												rv = avcodec_send_frame(ovcodec.get(), diframe);
+												if (rv < 0) {
 													char msg[100] = { 0 };
 													av_strerror(rv, msg, sizeof(msg) - 1);
 													std::cerr << "error:\tfailed to encode video frame (" << rv << ")" << std::endl;
 													std::cerr << "\t" << msg << std::endl;
 													return rv;
+												}
+												while (true) {
+													AVPacket outpacket = { 0 };
+													av_init_packet(&outpacket);
+													rv = avcodec_receive_packet(ovcodec.get(), &outpacket);
+													if (rv >= 0) {
+														++video_packet_count;
+														outpacket.stream_index = video_stream_index;
+														av_packet_rescale_ts(&outpacket, ovcodec->time_base, ovstream->time_base);
+														if (outpacket.pts <= vpts) {
+															++vpts;
+															outpacket.pts = vpts;
+														} else {
+															vpts = outpacket.pts;
+														}
+														if (outpacket.dts <= vdts) {
+															++vdts;
+															outpacket.dts = vdts;
+														} else {
+															vdts = outpacket.dts;
+														}
+														rv = av_interleaved_write_frame(oformat.get(), &outpacket);
+														if (rv < 0) {
+															char msg[100] = { 0 };
+															av_strerror(rv, msg, sizeof(msg) - 1);
+															std::cerr << "error:\tfailed to write interleaved video frame (" << rv << ")" << std::endl;
+															std::cerr << "\t" << msg << std::endl;
+															return rv;
+														}
+													} else if (rv == AVERROR(EAGAIN)) {
+														break;
+													} else {
+														char msg[100] = { 0 };
+														av_strerror(rv, msg, sizeof(msg) - 1);
+														std::cerr << "error:\tfailed to encode video frame (" << rv << ")" << std::endl;
+														std::cerr << "\t" << msg << std::endl;
+														return rv;
+													}
 												}
 											}
 										}

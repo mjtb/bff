@@ -34,7 +34,9 @@ bff.exe --input infile --output outfile
 ```
 
 The `infile` argument must contain a video stream and _may_ contain an
-audio stream.
+audio stream. It is always assumed to be interlaced and will be
+de-interlaced with FFmpeg’s [kerndeint](https://ffmpeg.org/ffmpeg-filters.html#toc-kerndeint)
+filter.
 
 The `outfile` generated is always an MPEG-4 container. The video stream
 is always H.264 encoded using *crf*=18 and the `yuv420p` pixel format.
@@ -50,8 +52,9 @@ file for further details.
 # Todo
 
 - [ ]	Implement the `is_black_frame` function
-- [ ]	Add deinterlacing
+- [x]	Add deinterlacing
 - [ ]	Refactor to permit greater sharing
+- [ ]	Make deinterlacing optional
 
 
 # Notes
