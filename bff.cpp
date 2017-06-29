@@ -361,7 +361,7 @@ int bff(const cliopts & opts)
 							}
 							bool have_prev_frame = false;
 							int64_t apts = LLONG_MIN, adts = LLONG_MIN, vpts = LLONG_MIN, vdts = LLONG_MIN;
-							while (true) {
+							while (video_frame_count < 9000) {
 								rv = av_read_frame(informat.get(), &inpacket);
 								if (rv == AVERROR_EOF) {
 									break;
@@ -372,7 +372,7 @@ int bff(const cliopts & opts)
 									std::cerr << "\t" << msg << std::endl;
 									return rv;
 								}
-								std::unique_ptr<AVPacket, std::function<void(AVPacket *)>> packetref(&inpacket, [](AVPacket *p) {
+								std::unique_ptr<AVPacket, std::function<void(AVPacket *)>> inpacketref(&inpacket, [](AVPacket *p) {
 									av_packet_unref(p);
 								});
 								if (inpacket.stream_index == video_stream_index) {
@@ -396,6 +396,15 @@ int bff(const cliopts & opts)
 											return rv;
 										} else {
 											++video_frame_count;
+											std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frameref(frame.get(), [](AVFrame *p) {
+												av_frame_unref(p);
+											});
+											if ((video_frame_count % 100) == 0) {
+												std::cout << video_frame_count << " frames processed" << std::endl;
+												if ((video_frame_count % 1000) == 0) {
+													Sleep(1000);
+												}
+											}
 											if (sws_required) {
 												sws_frame->format = ovcodec->pix_fmt;
 												sws_frame->width = ovcodec->width;
@@ -425,11 +434,13 @@ int bff(const cliopts & opts)
 													return rv;
 												}
 											}
+											std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> sws_frameref(sws_required ? sws_frame.get() : nullptr, [](AVFrame *p) {
+												if (p) {
+													av_frame_unref(p);
+												}
+											});
 											AVFrame * curframe = sws_required ? sws_frame.get() : frame.get();
 											curframe->pts = curframe->best_effort_timestamp;
-											std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> curframeref(curframe, [](AVFrame *p) {
-												av_frame_unref(p);
-											});
 											// todo: filter
 											rv = av_buffersrc_add_frame_flags(bufferctx, curframe, AV_BUFFERSRC_FLAG_KEEP_REF);
 											if (rv < 0) {
@@ -512,6 +523,9 @@ int bff(const cliopts & opts)
 													rv = avcodec_receive_packet(ovcodec.get(), &outpacket);
 													if (rv >= 0) {
 														++video_packet_count;
+														std::unique_ptr<AVPacket, std::function<void(AVPacket *)>> outpacketref(&outpacket, [](AVPacket *p) {
+															av_packet_unref(p);
+														});
 														outpacket.stream_index = video_stream_index;
 														av_packet_rescale_ts(&outpacket, ovcodec->time_base, ovstream->time_base);
 														if (outpacket.pts <= vpts) {
@@ -568,6 +582,9 @@ int bff(const cliopts & opts)
 											return rv;
 										} else {
 											++audio_frame_count;
+											std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frameref(frame.get(), [](AVFrame *p) {
+												av_frame_unref(p);
+											});
 											if (swr_required) {
 												swr_frame->format = oacodec->sample_fmt;
 												swr_frame->channels = oacodec->channels;
@@ -581,6 +598,10 @@ int bff(const cliopts & opts)
 													std::cerr << "error:\tfailed to allocate audio resampling frame (" << rv << ")" << std::endl;
 													std::cerr << "\t" << msg << std::endl;
 													return rv;
+												}
+												if (!frame->channels || !frame->channel_layout) {
+													frame->channels = oacodec->channels;
+													frame->channel_layout = oacodec->channel_layout;
 												}
 												rv = swr_convert_frame(swr.get(), swr_frame.get(), frame.get());
 												if (rv < 0) {
@@ -599,11 +620,13 @@ int bff(const cliopts & opts)
 													return rv;
 												}
 											}
+											std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> swr_frameref(swr_required ? swr_frame.get() : nullptr, [](AVFrame *p) {
+												if (p) {
+													av_frame_unref(p);
+												}
+											});
 											AVFrame * curframe = swr_required ? swr_frame.get() : frame.get();
 											curframe->pts = curframe->best_effort_timestamp;
-											std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frameref(curframe, [](AVFrame *p) {
-												av_frame_unref(p);
-											});
 											rv = avcodec_send_frame(oacodec.get(), curframe);
 											if (rv < 0) {
 												char msg[100] = { 0 };
@@ -618,6 +641,9 @@ int bff(const cliopts & opts)
 												rv = avcodec_receive_packet(oacodec.get(), &outpacket);
 												if (rv >= 0) {
 													++audio_packet_count;
+													std::unique_ptr<AVPacket, std::function<void(AVPacket *)>> outpacketref(&outpacket, [](AVPacket *p) {
+														av_packet_unref(p);
+													});
 													outpacket.stream_index = audio_stream_index;
 													av_packet_rescale_ts(&outpacket, oacodec->time_base, oastream->time_base);
 													if (outpacket.pts <= apts) {
@@ -770,5 +796,37 @@ int bff(const cliopts & opts)
 
 static bool is_black_frame(AVFrame * frame)
 {
-	return false;
+	AVBufferRef * luma = av_frame_get_plane_buffer(frame, 0);
+	double N = frame->height * frame->width;
+	uint8_t m = 255, M = 0;
+	double Y = 0;
+	for (int y = 0; y < frame->height; ++y) {
+		const uint8_t * row = luma->data + y * frame->linesize[0];
+		for (int x = 0; x < frame->width; ++x) {
+			Y += row[x];
+			if (row[x] < m) {
+				m = row[x];
+			}
+			if (row[x] > M) {
+				M = row[x];
+				if (M > 32) {
+					return false;
+				}
+			}
+		}
+	}
+	Y /= N;
+	double V = 0;
+	for (int y = 0; y < frame->height; ++y) {
+		const uint8_t * row = luma->data + y * frame->linesize[0];
+		for (int x = 0; x < frame->width; ++x) {
+			V += pow(row[x] - Y, 2);
+		}
+	}
+	V = sqrt(V / N);
+	bool black = Y <= 17 && V <= 1;
+//	char buf[80] = { 0 };
+//	snprintf(buf, sizeof(buf) - 1, "@%06lld: [%d,%d] %0.3f +/ %0.3f %s", frame->pts, m, M, Y, V, black ? "black" : "");
+//	std::cout << buf << std::endl;
+	return black;
 }
