@@ -5,6 +5,10 @@
 #include "stdafx.h"
 
 #include "bff.h"
+
+#include <cstdarg>
+#include <vector>
+
 extern "C" {
 #include <libavutil\avutil.h>
 #include <libavcodec\avcodec.h>
@@ -54,7 +58,7 @@ int bff(const cliopts & opts)
 	av_register_all();
 	avfilter_register_all();
 	// statistics to display
-	uint64_t video_frame_count = 0, audio_frame_count = 0;
+	uint64_t video_frame_count = 0, audio_frame_count = 0, black_frame_count = 0;
 	uint64_t video_packet_count = 0, audio_packet_count = 0;
 	// open input
 	AVFormatContext *p = nullptr;
@@ -256,8 +260,7 @@ int bff(const cliopts & opts)
 								av_frame_free(&p);
 							});
 							if (!prev_frame) {
-								std::cerr << "error: cannot allocate required frames" << std::endl;
-								return 2;
+								throw ffmpeg_error(AVERROR_UNKNOWN, "av_frame_alloc", "prev_frame");
 							}
 							bool have_prev_frame = false;
 							int64_t apts = LLONG_MIN, adts = LLONG_MIN, vpts = LLONG_MIN, vdts = LLONG_MIN;
@@ -269,20 +272,12 @@ int bff(const cliopts & opts)
 								if (rv == AVERROR_EOF) {
 									break;
 								} else if (rv < 0) {
-									char msg[100] = { 0 };
-									av_strerror(rv, msg, sizeof(msg) - 1);
-									std::cerr << "error:\tfailed to read input (" << rv << ")" << std::endl;
-									std::cerr << "\t" << msg << std::endl;
-									return rv;
+									throw ffmpeg_error(rv, "av_read_frame", "input");
 								}
 								if (inpacket->stream_index == video_stream_index) {
 									rv = avcodec_send_packet(invcodec.get(), inpacket.get());
 									if (rv < 0) {
-										char msg[100] = { 0 };
-										av_strerror(rv, msg, sizeof(msg) - 1);
-										std::cerr << "error:\tfailed to decode packet (" << rv << ")" << std::endl;
-										std::cerr << "\t" << msg << std::endl;
-										return rv;
+										throw ffmpeg_error(rv, "avcodec_send_packet", "input");
 									}
 									while (rv >= 0) {
 										std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame(av_frame_alloc(), [](AVFrame * p) {
@@ -292,18 +287,11 @@ int bff(const cliopts & opts)
 										if (rv == AVERROR(EAGAIN) || rv == AVERROR_EOF) {
 											break;
 										} else if (rv < 0) {
-											char msg[100] = { 0 };
-											av_strerror(rv, msg, sizeof(msg) - 1);
-											std::cerr << "error:\tfailed to receive video frame (" << rv << ")" << std::endl;
-											std::cerr << "\t" << msg << std::endl;
-											return rv;
+											throw ffmpeg_error(rv, "avcodec_receive_frame", "input video");
 										} else {
 											++video_frame_count;
 											if ((video_frame_count % 100) == 0) {
-												std::cout << video_frame_count << " frames processed" << std::endl;
-												if ((video_frame_count % 1000) == 0) {
-													Sleep(1000);
-												}
+												std::cout << video_frame_count << " frames processed, " << black_frame_count << " black frame(s) encountered" << std::endl;
 											}
 											std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> sws_frame(sws_required ? av_frame_alloc() : nullptr, [](AVFrame * p) {
 												if (p) {
@@ -312,8 +300,7 @@ int bff(const cliopts & opts)
 												}
 											});
 											if (sws_required && !sws_frame) {
-												std::cerr << "error: cannot allocate required frames" << std::endl;
-												return 2;
+												throw ffmpeg_error(AVERROR_UNKNOWN, "av_frame_alloc", "sws");
 											}
 											if (sws_required) {
 												std::unique_ptr<SwsContext, std::function<void(SwsContext*)>> sws(sws_required ? sws_getContext(invcodec->width, invcodec->height, invcodec->pix_fmt, ovcodec->width, ovcodec->height, ovcodec->pix_fmt, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr) : nullptr, [](SwsContext *p) {
@@ -326,38 +313,22 @@ int bff(const cliopts & opts)
 												sws_frame->height = ovcodec->height;
 												rv = av_image_alloc(sws_frame->data, sws_frame->linesize, sws_frame->width, sws_frame->height, (AVPixelFormat)sws_frame->format, 32);
 												if (rv < 0) {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to allocate yuv420p frame (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
+													throw ffmpeg_error(rv, "av_image_alloc", "sws");
 												}
 												rv = sws_scale(sws.get(), frame->data, frame->linesize, 0, frame->height, sws_frame->data, sws_frame->linesize);
 												if (rv < 0) {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to convert input video frame to yuv420p (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
+													throw ffmpeg_error(rv, "sws_scale", "");
 												}
 												rv = av_frame_copy_props(sws_frame.get(), frame.get());
 												if (rv < 0) {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to frame metadata (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
+													throw ffmpeg_error(rv, "av_frame_copy_props", "sws");
 												}
 											}
 											AVFrame * curframe = sws_required ? sws_frame.get() : frame.get();
 											curframe->pts = curframe->best_effort_timestamp;
 											rv = av_buffersrc_add_frame_flags(bufferctx, curframe, AV_BUFFERSRC_FLAG_KEEP_REF);
 											if (rv < 0) {
-												char msg[100] = { 0 };
-												av_strerror(rv, msg, sizeof(msg) - 1);
-												std::cerr << "error:\tfailed to push frame into filter graph (" << rv << ")" << std::endl;
-												std::cerr << "\t" << msg << std::endl;
-												return rv;
+												throw ffmpeg_error(rv, "av_buffersrc_add_frame_flags", "");
 											}
 											while (true) {
 												std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> deinterlaced_frame(av_frame_alloc(), [](AVFrame * p) {
@@ -367,21 +338,14 @@ int bff(const cliopts & opts)
 												if ((rv == AVERROR(EAGAIN)) || (rv == AVERROR_EOF)) {
 													break;
 												} else if (rv < 0) {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to pull frames into filter graph (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
+													throw ffmpeg_error(rv, "av_buffersink_get_frame", "");
 												}
 												if (is_black_frame(deinterlaced_frame.get())) {
 													if (have_prev_frame) {
+														++black_frame_count;
 														rv = av_frame_copy(deinterlaced_frame.get(), prev_frame.get());
 														if (rv < 0) {
-															char msg[100] = { 0 };
-															av_strerror(rv, msg, sizeof(msg) - 1);
-															std::cerr << "error:\tfailed to copy previous video frame data (" << rv << ")" << std::endl;
-															std::cerr << "\t" << msg << std::endl;
-															return rv;
+															throw ffmpeg_error(rv, "av_frame_copy", "deinterlaced");
 														}
 													}
 												} else {
@@ -392,38 +356,22 @@ int bff(const cliopts & opts)
 														memcpy(prev_frame->linesize, deinterlaced_frame->linesize, sizeof(prev_frame->linesize));
 														rv = av_frame_get_buffer(prev_frame.get(), 0);
 														if (rv < 0) {
-															char msg[100] = { 0 };
-															av_strerror(rv, msg, sizeof(msg) - 1);
-															std::cerr << "error:\tfailed to allocate video frame data (" << rv << ")" << std::endl;
-															std::cerr << "\t" << msg << std::endl;
-															return rv;
+															throw ffmpeg_error(rv, "av_frame_get_buffer", "deinterlaced");
 														}
 														have_prev_frame = true;
 													}
 													rv = av_frame_copy(prev_frame.get(), deinterlaced_frame.get());
 													if (rv < 0) {
-														char msg[100] = { 0 };
-														av_strerror(rv, msg, sizeof(msg) - 1);
-														std::cerr << "error:\tfailed to copy current video frame data (" << rv << ")" << std::endl;
-														std::cerr << "\t" << msg << std::endl;
-														return rv;
+														throw ffmpeg_error(rv, "av_frame_copy", "deinterlaced");
 													}
 													rv = av_frame_copy_props(prev_frame.get(), deinterlaced_frame.get());
 													if (rv < 0) {
-														char msg[100] = { 0 };
-														av_strerror(rv, msg, sizeof(msg) - 1);
-														std::cerr << "error:\tfailed to frame metadata (" << rv << ")" << std::endl;
-														std::cerr << "\t" << msg << std::endl;
-														return rv;
+														throw ffmpeg_error(rv, "av_frame_copy_props", "deinterlaced");
 													}
 												}
 												rv = avcodec_send_frame(ovcodec.get(), deinterlaced_frame.get());
 												if (rv < 0) {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to encode video frame (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
+													throw ffmpeg_error(rv, "avcodec_send_frame", "output video");
 												}
 												while (true) {
 													std::unique_ptr<AVPacket, std::function<void(AVPacket *)>> outpacket(av_packet_alloc(), [](AVPacket *p) {
@@ -448,20 +396,12 @@ int bff(const cliopts & opts)
 														}
 														rv = av_interleaved_write_frame(oformat.get(), outpacket.get());
 														if (rv < 0) {
-															char msg[100] = { 0 };
-															av_strerror(rv, msg, sizeof(msg) - 1);
-															std::cerr << "error:\tfailed to write interleaved video frame (" << rv << ")" << std::endl;
-															std::cerr << "\t" << msg << std::endl;
-															return rv;
+															throw ffmpeg_error(rv, "av_interleaved_write_frame", "video");
 														}
 													} else if (rv == AVERROR(EAGAIN)) {
 														break;
 													} else {
-														char msg[100] = { 0 };
-														av_strerror(rv, msg, sizeof(msg) - 1);
-														std::cerr << "error:\tfailed to encode video frame (" << rv << ")" << std::endl;
-														std::cerr << "\t" << msg << std::endl;
-														return rv;
+														throw ffmpeg_error(rv, "avcodec_receive_packet", "output video");
 													}
 												}
 											}
@@ -470,11 +410,7 @@ int bff(const cliopts & opts)
 								} else if (has_audio && (inpacket->stream_index == audio_stream_index)) {
 									rv = avcodec_send_packet(inacodec.get(), inpacket.get());
 									if (rv < 0) {
-										char msg[100] = { 0 };
-										av_strerror(rv, msg, sizeof(msg) - 1);
-										std::cerr << "error:\tfailed to decode audio packet (" << rv << ")" << std::endl;
-										std::cerr << "\t" << msg << std::endl;
-										return rv;
+										throw ffmpeg_error(rv, "avcodec_send_packet", "input audio");
 									}
 									while (rv >= 0) {
 										std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> frame(av_frame_alloc(), [](AVFrame * p) {
@@ -484,11 +420,7 @@ int bff(const cliopts & opts)
 										if (rv == AVERROR(EAGAIN) || rv == AVERROR_EOF) {
 											break;
 										} else if (rv < 0) {
-											char msg[100] = { 0 };
-											av_strerror(rv, msg, sizeof(msg) - 1);
-											std::cerr << "error:\tfailed to receive audio frame (" << rv << ")" << std::endl;
-											std::cerr << "\t" << msg << std::endl;
-											return rv;
+											throw ffmpeg_error(rv, "avcodec_receive_frame", "input audio");
 										} else {
 											++audio_frame_count;
 											std::unique_ptr<AVFrame, std::function<void(AVFrame*)>> swr_frame(swr_required ? av_frame_alloc() : nullptr, [](AVFrame * p) {
@@ -498,8 +430,7 @@ int bff(const cliopts & opts)
 												}
 											});
 											if (swr_required && !swr_frame) {
-												std::cerr << "error: cannot allocate required frames" << std::endl;
-												return 2;
+												throw ffmpeg_error(AVERROR_UNKNOWN, "av_frame_alloc", "swr");
 											}
 											if (swr_required) {
 												std::unique_ptr<SwrContext, std::function<void(SwrContext*)>> swr(swr_required ? swr_alloc_set_opts(nullptr, oacodec->channel_layout, oacodec->sample_fmt, oacodec->sample_rate, inacodec->channel_layout, inacodec->sample_fmt, inacodec->sample_rate, 0, nullptr) : nullptr, [](SwrContext *p) {
@@ -514,11 +445,7 @@ int bff(const cliopts & opts)
 												swr_frame->nb_samples = swr_get_out_samples(swr.get(), frame->nb_samples);
 												rv = av_samples_alloc(swr_frame->data, swr_frame->linesize, swr_frame->channels, swr_frame->nb_samples, (AVSampleFormat)swr_frame->format, 32);
 												if (rv < 0) {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to allocate audio resampling frame (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
+													throw ffmpeg_error(rv, "av_samples_alloc", "swr");
 												}
 												if (!frame->channels || !frame->channel_layout) {
 													frame->channels = oacodec->channels;
@@ -526,30 +453,18 @@ int bff(const cliopts & opts)
 												}
 												rv = swr_convert_frame(swr.get(), swr_frame.get(), frame.get());
 												if (rv < 0) {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to convert input audio frame to required format (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
+													throw ffmpeg_error(rv, "swr_convert_frame", "");
 												}
 												rv = av_frame_copy_props(swr_frame.get(), frame.get());
 												if (rv < 0) {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to copy audio frame metadata (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
+													throw ffmpeg_error(rv, "av_frame_copy_props", "swr");
 												}
 											}
 											AVFrame * curframe = swr_required ? swr_frame.get() : frame.get();
 											curframe->pts = curframe->best_effort_timestamp;
 											rv = avcodec_send_frame(oacodec.get(), curframe);
 											if (rv < 0) {
-												char msg[100] = { 0 };
-												av_strerror(rv, msg, sizeof(msg) - 1);
-												std::cerr << "error:\tfailed to encode audio frame (" << rv << ")" << std::endl;
-												std::cerr << "\t" << msg << std::endl;
-												return rv;
+												throw ffmpeg_error(rv, "avcodec_send_frame", "audio");
 											}
 											while (true) {
 												std::unique_ptr<AVPacket, std::function<void(AVPacket *)>> outpacket(av_packet_alloc(), [](AVPacket *p) {
@@ -574,20 +489,12 @@ int bff(const cliopts & opts)
 													}
 													rv = av_interleaved_write_frame(oformat.get(), outpacket.get());
 													if (rv < 0) {
-														char msg[100] = { 0 };
-														av_strerror(rv, msg, sizeof(msg) - 1);
-														std::cerr << "error:\tfailed to write interleaved audio frame (" << rv << ")" << std::endl;
-														std::cerr << "\t" << msg << std::endl;
-														return rv;
+														throw ffmpeg_error(rv, "av_interleaved_write_frame", "audio");
 													}
 												} else if (rv == AVERROR(EAGAIN)) {
 													break;
 												} else {
-													char msg[100] = { 0 };
-													av_strerror(rv, msg, sizeof(msg) - 1);
-													std::cerr << "error:\tfailed to encode audio frame (" << rv << ")" << std::endl;
-													std::cerr << "\t" << msg << std::endl;
-													return rv;
+													throw ffmpeg_error(rv, "avcodec_receive_packet", "audio");
 												}
 											}
 										}
@@ -597,11 +504,7 @@ int bff(const cliopts & opts)
 							if (ovcodec->codec->capabilities & AV_CODEC_CAP_DELAY) {
 								rv = avcodec_send_frame(ovcodec.get(), nullptr);
 								if (rv < 0) {
-									char msg[100] = { 0 };
-									av_strerror(rv, msg, sizeof(msg) - 1);
-									std::cerr << "error:\tfailed to flush video frames (" << rv << ")" << std::endl;
-									std::cerr << "\t" << msg << std::endl;
-									return rv;
+									throw ffmpeg_error(rv, "avcodec_send_frame", "flush video");
 								}
 								while (true) {
 									std::unique_ptr<AVPacket, std::function<void(AVPacket *)>> outpacket(av_packet_alloc(), [](AVPacket *p) {
@@ -626,31 +529,19 @@ int bff(const cliopts & opts)
 										}
 										rv = av_interleaved_write_frame(oformat.get(), outpacket.get());
 										if (rv < 0) {
-											char msg[100] = { 0 };
-											av_strerror(rv, msg, sizeof(msg) - 1);
-											std::cerr << "error:\tfailed to write interleaved video frame (" << rv << ")" << std::endl;
-											std::cerr << "\t" << msg << std::endl;
-											return rv;
+											throw ffmpeg_error(rv, "av_interleaved_write_frame", "flush video");
 										}
 									} else if (rv == AVERROR(EAGAIN) || rv == AVERROR_EOF) {
 										break;
 									} else {
-										char msg[100] = { 0 };
-										av_strerror(rv, msg, sizeof(msg) - 1);
-										std::cerr << "error:\tfailed to encode video frame (" << rv << ")" << std::endl;
-										std::cerr << "\t" << msg << std::endl;
-										return rv;
+										throw ffmpeg_error(rv, "avcodec_receive_packet", "flush video");
 									}
 								}
 							}
 							if (has_audio && (oacodec->codec->capabilities & AV_CODEC_CAP_DELAY)) {
 								rv = avcodec_send_frame(oacodec.get(), nullptr);
 								if (rv < 0) {
-									char msg[100] = { 0 };
-									av_strerror(rv, msg, sizeof(msg) - 1);
-									std::cerr << "error:\tfailed to flush audio frame (" << rv << ")" << std::endl;
-									std::cerr << "\t" << msg << std::endl;
-									return rv;
+									throw ffmpeg_error(rv, "avcodec_send_frame", "flush audio");
 								}
 								while (true) {
 									std::unique_ptr<AVPacket, std::function<void(AVPacket *)>> outpacket(av_packet_alloc(), [](AVPacket *p) {
@@ -675,30 +566,18 @@ int bff(const cliopts & opts)
 										}
 										rv = av_interleaved_write_frame(oformat.get(), outpacket.get());
 										if (rv < 0) {
-											char msg[100] = { 0 };
-											av_strerror(rv, msg, sizeof(msg) - 1);
-											std::cerr << "error:\tfailed to write interleaved audio frame (" << rv << ")" << std::endl;
-											std::cerr << "\t" << msg << std::endl;
-											return rv;
+											throw ffmpeg_error(rv, "av_interleaved_write_frame", "flush audio");
 										}
 									} else if (rv == AVERROR(EAGAIN) || rv == AVERROR_EOF) {
 										break;
 									} else {
-										char msg[100] = { 0 };
-										av_strerror(rv, msg, sizeof(msg) - 1);
-										std::cerr << "error:\tfailed to encode audio frame (" << rv << ")" << std::endl;
-										std::cerr << "\t" << msg << std::endl;
-										return rv;
+										throw ffmpeg_error(rv, "avcodec_receive_packet", "flush audio");
 									}
 								}
 							}
 							rv = av_write_trailer(oformat.get());
 							if (rv < 0) {
-								char msg[100] = { 0 };
-								av_strerror(rv, msg, sizeof(msg) - 1);
-								std::cerr << "error:\tfailed to write output file trailer (" << rv << ")" << std::endl;
-								std::cerr << "\t" << msg << std::endl;
-								return rv;
+								throw ffmpeg_error(rv, "av_write_trailer", "");
 							}
 						}
 					}
@@ -707,42 +586,107 @@ int bff(const cliopts & opts)
 		}
 	}
 	std::cout << "info:\tprocessed " << video_frame_count << " video and " << audio_frame_count << " audio frames" << std::endl;
+	std::cout << "info:\tsubstituted " << black_frame_count << " black frames" << std::endl;
 	return 0;
 }
 
-static bool is_black_frame(AVFrame * frame)
+static void luma_histogram(const uint8_t * Y, int width, int height, int linesize, int lim, int * count, ...)
 {
-	AVBufferRef * luma = av_frame_get_plane_buffer(frame, 0);
-	double N = frame->height * frame->width;
+	va_list ap;
+	va_start(ap, count);
+	const size_t NUM_LIMS = 256;
+	int * lims = (int *)alloca(sizeof(int) * NUM_LIMS);
+	int ** counts = (int **)alloca(sizeof(int *) * NUM_LIMS);
+	lims[0] = lim;
+	counts[0] = count;
+	*count = 0;
+	size_t num = 1;
+	while (num < NUM_LIMS) {
+		int lim = va_arg(ap, int);
+		if (lim <= 0) {
+			break;
+		} else {
+			int * count = va_arg(ap, int *);
+			*count = 0;
+			lims[num] = lim;
+			counts[num] = count;
+			++num;
+		}
+	}
+	for (int y = 0; y < height; ++y) {
+		const uint8_t * row = Y + y * linesize;
+		for (int x = 0; x < width; ++x) {
+			int v = row[x];
+			for (size_t i = 0; i < num; ++i) {
+				if (lims[i] >= v) {
+					++*(counts[i]);
+					break;
+				}
+			}
+		}
+	}
+}
+
+static void luma_statistics(const uint8_t * Y, int width, int height, int linesize, uint8_t * range_min, uint8_t * range_max, double * mean, double * stdev)
+{
+	double N = width * height;
+	double S = 0;
 	uint8_t m = 255, M = 0;
-	double Y = 0;
-	for (int y = 0; y < frame->height; ++y) {
-		const uint8_t * row = luma->data + y * frame->linesize[0];
-		for (int x = 0; x < frame->width; ++x) {
-			Y += row[x];
+	for (int y = 0; y < height; ++y) {
+		const uint8_t * row = Y + y * linesize;
+		for (int x = 0; x < width; ++x) {
+			S += row[x];
 			if (row[x] < m) {
 				m = row[x];
 			}
 			if (row[x] > M) {
 				M = row[x];
-				if (M > 32) {
-					return false;
-				}
 			}
 		}
 	}
-	Y /= N;
+	S /= N;
 	double V = 0;
-	for (int y = 0; y < frame->height; ++y) {
-		const uint8_t * row = luma->data + y * frame->linesize[0];
-		for (int x = 0; x < frame->width; ++x) {
-			V += pow(row[x] - Y, 2);
+	for (int y = 0; y < height; ++y) {
+		const uint8_t * row = Y + y * linesize;
+		for (int x = 0; x < width; ++x) {
+			V += pow(row[x] - S, 2);
 		}
 	}
 	V = sqrt(V / N);
-	bool black = Y <= 17 && V <= 1;
-//	char buf[80] = { 0 };
-//	snprintf(buf, sizeof(buf) - 1, "@%06lld: [%d,%d] %0.3f +/ %0.3f %s", frame->pts, m, M, Y, V, black ? "black" : "");
-//	std::cout << buf << std::endl;
-	return black;
+	if (range_min) {
+		*range_min = m;
+	}
+	if (range_max) {
+		*range_max = M;
+	}
+	if (mean) {
+		*mean = S;
+	}
+	if (stdev) {
+		*stdev = V;
+	}
+}
+
+static bool is_statistically_black_frame(AVFrame * frame, double mean_threshold = 17, double stdev_threshold = 1)
+{
+	AVBufferRef * luma = av_frame_get_plane_buffer(frame, 0);
+	double mean = 0, stdev = 0;
+	luma_statistics(luma->data, frame->width, frame->height, frame->linesize[0], nullptr, nullptr, &mean, &stdev);
+	return ((mean <= mean_threshold) && (stdev <= stdev_threshold));
+}
+
+static bool is_proportionally_black_frame(AVFrame * frame, uint8_t y_max = 17, double proportion_threshold = 0.86)
+{
+	AVBufferRef * luma = av_frame_get_plane_buffer(frame, 0);
+	int count = 0;
+	luma_histogram(luma->data, frame->width, frame->height, frame->linesize[0], (int)y_max, &count, 0);
+	double proportion = count / (double)(frame->width * frame->height);
+	return (proportion >= proportion_threshold);
+}
+
+static bool is_black_frame(AVFrame * frame)
+{
+	AVBufferRef * luma = av_frame_get_plane_buffer(frame, 0);
+//	return is_statistically_black_frame(frame);
+	return is_proportionally_black_frame(frame);
 }
