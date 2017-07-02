@@ -264,7 +264,7 @@ int bff(const cliopts & opts)
 							}
 							bool have_prev_frame = false;
 							int64_t apts = LLONG_MIN, adts = LLONG_MIN, vpts = LLONG_MIN, vdts = LLONG_MIN;
-							while (video_frame_count < 9000) {
+							while (true) {
 								std::unique_ptr<AVPacket, std::function<void(AVPacket *)>> inpacket(av_packet_alloc(), [](AVPacket *p) {
 									av_packet_free(&p);
 								});
